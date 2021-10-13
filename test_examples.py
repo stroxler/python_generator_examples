@@ -23,6 +23,120 @@ def test_send_only():
     assert sent == [42]
 
 
+# Verify behavior of generator yield from ---------
+#
+# According to PEP 380:
+# - both input and output yields get proxied
+# - the yield from expression evaluates to the return
+#   value of the inner generator
+# - we still have to explicitly return, the inner return
+#   value will *not* be proxied.
+#
+# My hand-written test appears to diverge from this
+# behavior, I'm perplexed as to why. If I use the official
+# unit test, which has slightly simpler control flow, then
+# things appear to proxy as expected.
+
+def make_yield_from_demonstration():
+
+    sent = []
+
+    def inner():
+        sent.append("inner: {!r}".format((yield "from inner")))
+        return "inner return value"
+
+    def outer():
+        sent.append("outer before: " + (yield "from outer before"))
+        inner_return = yield from inner()
+        sent.append("outer after: " + (yield "from outer after"))
+        return inner_return, "second value from outer"
+
+    return outer, sent
+
+
+def test_yield_from():
+    outer, sent = make_yield_from_demonstration()
+
+    yielded = []
+    with pytest.raises(StopIteration) as stop:
+        coroutine = outer()
+        while True:
+            yielded.append(next(coroutine))
+            coroutine.send("hello")
+    # The value yielded from inner appears to get dropped. This seems to violate
+    # PEP 380, but maybe something in my setup is incorrect.
+    assert yielded == ["from outer before", "from outer after"]
+    # It seems like the "hello" we send to `outer` does not get passed in
+    # which similarly appears to violate PEP 380.
+    assert sent == ["outer before: hello", "inner: None", "outer after: hello"]
+    assert stop.value.value == ("inner return value", "second value from outer")
+
+
+# The behavior above appears to me to be a bug.
+#
+# I think that the python interpreter may not be proxying in
+# a composable way... I noticed that the unit test in CPython (see
+# below) only checks the special case where the entire outer generator
+# is a yield from, with no direct yields. But I don't think the PEP
+# has this restriction, it seems like pretty bad behavior.
+#
+# Here's what I get using identical code except no bare yield
+# statements in the outer generator: now it proxies correctly!
+
+def make_yield_from_demonstration_no_outer_yields():
+
+    sent = []
+
+    def inner():
+        sent.append("inner: {!r}".format((yield "from inner")))
+        return "inner return value"
+
+    def outer():
+        inner_return = yield from inner()
+        return inner_return, "second value from outer"
+
+    return outer, sent
+
+
+def test_yield_from_no_outer_yeilds():
+    outer, sent = make_yield_from_demonstration_no_outer_yields()
+
+    yielded = []
+    with pytest.raises(StopIteration) as stop:
+        coroutine = outer()
+        while True:
+            yielded.append(next(coroutine))
+            coroutine.send("hello")
+    # Now things proxy correctly!!
+    assert yielded == ["from inner"]
+    assert sent == ["inner: 'hello'"]
+    assert stop.value.value == ("inner return value", "second value from outer")
+
+
+def test_yield_from_CPython_version():
+    # This test I pulled from the official CPython unit tests
+    # in Lib/test/test_generators.py.
+    #
+    # It appears to respect PEP 380, so I'm not sure what the problem
+    # is above
+    f = lambda: (yield 1)
+    def g(): return (yield 1)
+
+    # test 'yield from'
+    f2 = lambda: (yield from g())
+    def g2(): return (yield from g())
+
+    f3 = lambda: (yield from f())
+    def g3(): return (yield from f())
+
+    for gen_fun in (f, g, f2, g2, f3, g3):
+        gen = gen_fun()
+        assert next(gen) == 1
+        with pytest.raises(StopIteration) as cm:
+            gen.send(2)
+        assert cm.value.value == 2
+    
+
 # async and yield from ------------
 #
 # But as of 3.9 using @asyncio.coroutine gives a
