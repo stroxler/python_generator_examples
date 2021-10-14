@@ -22,20 +22,22 @@ def test_send_only():
     assert out is None
     assert sent == [42]
 
-
+    
 # Verify behavior of generator yield from ---------
 #
 # According to PEP 380:
-# - both input and output yields get proxied
-# - the yield from expression evaluates to the return
-#   value of the inner generator
-# - we still have to explicitly return, the inner return
-#   value will *not* be proxied.
-#
-# My hand-written test appears to diverge from this
-# behavior, I'm perplexed as to why. If I use the official
-# unit test, which has slightly simpler control flow, then
-# things appear to proxy as expected.
+# - all data sent to a generator gets proxied to the
+#   inner generator called by yield from.
+# - all data returned by the inner generator gets proxied
+#   out to the caller of the outer generator.
+# - the yield from expression will evaluate to the return
+#   type of the inner generator.
+# - yield from never interacts directly with the return type
+#   of the outer generator (it's not unusual to directly return
+#   the yield from, but that has to be explicit. If we just
+#   yield from and don't return, the inner return value will
+#   be dropped.
+
 
 def make_yield_from_demonstration():
 
@@ -57,85 +59,54 @@ def make_yield_from_demonstration():
 def test_yield_from():
     outer, sent = make_yield_from_demonstration()
 
-    yielded = []
     with pytest.raises(StopIteration) as stop:
         coroutine = outer()
-        while True:
-            yielded.append(next(coroutine))
-            coroutine.send("hello")
-    # The value yielded from inner appears to get dropped. This seems to violate
-    # PEP 380, but maybe something in my setup is incorrect.
-    assert yielded == ["from outer before", "from outer after"]
-    # It seems like the "hello" we send to `outer` does not get passed in
-    # which similarly appears to violate PEP 380.
-    assert sent == ["outer before: hello", "inner: None", "outer after: hello"]
+        yielded = [next(coroutine)]
+        for letter in "abcdefghij":
+            yielded.append(coroutine.send(letter))
+    assert yielded == ["from outer before", "from inner", "from outer after"]
+    assert sent == ["outer before: a", "inner: 'b'", "outer after: c"]
     assert stop.value.value == ("inner return value", "second value from outer")
 
 
-# The behavior above appears to me to be a bug.
-#
-# I think that the python interpreter may not be proxying in
-# a composable way... I noticed that the unit test in CPython (see
-# below) only checks the special case where the entire outer generator
-# is a yield from, with no direct yields. But I don't think the PEP
-# has this restriction, it seems like pretty bad behavior.
-#
-# Here's what I get using identical code except no bare yield
-# statements in the outer generator: now it proxies correctly!
 
-def make_yield_from_demonstration_no_outer_yields():
+# What about yield from and iterators? ----------------
+#
+# Iterator[T] behaves exactly the same as Generator[None, T, None]
 
+
+def test_yield_from_iterator():
     sent = []
+    
+    def yields_from_list():
+        sent.append((yield "yielded_before"))
+        return_from_yf = yield from ["a", "b", "c"]
+        sent.append((yield "yielded_after"))
+        return (return_from_yf, "returned_from_generator")
 
-    def inner():
-        sent.append("inner: {!r}".format((yield "from inner")))
-        return "inner return value"
-
-    def outer():
-        inner_return = yield from inner()
-        return inner_return, "second value from outer"
-
-    return outer, sent
-
-
-def test_yield_from_no_outer_yeilds():
-    outer, sent = make_yield_from_demonstration_no_outer_yields()
-
+    # this test is special-cased because I'm exercising a strange edge
+    # condition: we're not allowed to send data to the list iterator or we get
+    #   AttributeError: 'list_iterator' object has no attribute 'send'
+    # but we are allowed to send to the surroundin generator.
+    #
+    # From a typechecking point of view, we should probably require that
+    # any generator yielding from an iterator has None as the send type;
+    # other behavior is legal but unsound and should require a pyre-ignore.
+    coroutine = yields_from_list()
     yielded = []
     with pytest.raises(StopIteration) as stop:
-        coroutine = outer()
-        while True:
-            yielded.append(next(coroutine))
-            coroutine.send("hello")
-    # Now things proxy correctly!!
-    assert yielded == ["from inner"]
-    assert sent == ["inner: 'hello'"]
-    assert stop.value.value == ("inner return value", "second value from outer")
+        yielded = [next(coroutine)]
+        yielded.append(coroutine.send("sent_before"))
+        for i in range(3):
+            # we could also use next(coroutine) here, which is
+            # equivalent to coroutine.send(None) according to PEP 342.
+            yielded.append(coroutine.send(None))
+        yielded.append(coroutine.send("sent_after"))
 
+    assert sent == ["sent_before", "sent_after"]
+    assert yielded == ["yielded_before", "a", "b", "c", "yielded_after"]
+    assert stop.value.value == (None, "returned_from_generator")
 
-def test_yield_from_CPython_version():
-    # This test I pulled from the official CPython unit tests
-    # in Lib/test/test_generators.py.
-    #
-    # It appears to respect PEP 380, so I'm not sure what the problem
-    # is above
-    f = lambda: (yield 1)
-    def g(): return (yield 1)
-
-    # test 'yield from'
-    f2 = lambda: (yield from g())
-    def g2(): return (yield from g())
-
-    f3 = lambda: (yield from f())
-    def g3(): return (yield from f())
-
-    for gen_fun in (f, g, f2, g2, f3, g3):
-        gen = gen_fun()
-        assert next(gen) == 1
-        with pytest.raises(StopIteration) as cm:
-            gen.send(2)
-        assert cm.value.value == 2
-    
 
 # async and yield from ------------
 #
